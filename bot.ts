@@ -22,10 +22,12 @@ import { createPoolKeys, logger, NETWORK, sleep } from './helpers';
 import { Mutex } from 'async-mutex';
 import BN from 'bn.js';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
+import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
 
 export interface BotConfig {
   wallet: Keypair;
   checkRenounced: boolean;
+  checkFreezable: boolean;
   checkBurned: boolean;
   minPoolSize: TokenAmount;
   maxPoolSize: TokenAmount;
@@ -62,6 +64,7 @@ export class Bot {
   private readonly mutex: Mutex;
   private sellExecutionCount = 0;
   public readonly isWarp: boolean = false;
+  public readonly isJito: boolean = false;
 
   constructor(
     private readonly connection: Connection,
@@ -71,6 +74,7 @@ export class Bot {
     readonly config: BotConfig,
   ) {
     this.isWarp = txExecutor instanceof WarpTransactionExecutor;
+    this.isJito = txExecutor instanceof JitoTransactionExecutor;
 
     this.mutex = new Mutex();
     this.poolFilters = new PoolFilters(connection, {
@@ -99,7 +103,7 @@ export class Bot {
   }
 
   public async buy(accountId: PublicKey, poolState: LiquidityStateV4) {
-    logger.trace({ mint: poolState.baseMint }, `Processing buy...`);
+    logger.trace({ mint: poolState.baseMint }, `Processing new pool...`);
 
     if (this.config.useSnipeList && !this.snipeListCache?.isInList(poolState.baseMint.toString())) {
       logger.debug({ mint: poolState.baseMint.toString() }, `Skipping buy because token is not in a snipe list`);
@@ -130,11 +134,13 @@ export class Bot {
       ]);
       const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(accountId, poolState, market);
 
-      const match = await this.filterMatch(poolKeys);
+      if (!this.config.useSnipeList) {
+        const match = await this.filterMatch(poolKeys);
 
-      if (!match) {
-        logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because pool doesn't match filters`);
-        return;
+        if (!match) {
+          logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because pool doesn't match filters`);
+          return;
+        }
       }
 
       for (let i = 0; i < this.config.maxBuyRetries; i++) {
@@ -169,10 +175,11 @@ export class Bot {
             break;
           }
 
-          logger.debug(
+          logger.info(
             {
               mint: poolState.baseMint.toString(),
               signature: result.signature,
+              error: result.error,
             },
             `Error confirming buy tx`,
           );
@@ -195,7 +202,7 @@ export class Bot {
     }
 
     try {
-      logger.trace({ mint: rawAccount.mint }, `Processing sell...`);
+      logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
 
       const poolData = await this.poolStorage.get(rawAccount.mint.toString());
 
@@ -258,6 +265,7 @@ export class Bot {
             {
               mint: rawAccount.mint.toString(),
               signature: result.signature,
+              error: result.error,
             },
             `Error confirming sell tx`,
           );
@@ -266,7 +274,7 @@ export class Bot {
         }
       }
     } catch (error) {
-      logger.debug({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
+      logger.error({ mint: rawAccount.mint.toString(), error }, `Failed to sell token`);
     } finally {
       if (this.config.oneTokenAtATime) {
         this.sellExecutionCount--;
@@ -274,6 +282,7 @@ export class Bot {
     }
   }
 
+  // noinspection JSUnusedLocalSymbols
   private async swap(
     poolKeys: LiquidityPoolKeysV4,
     ataIn: PublicKey,
@@ -318,7 +327,7 @@ export class Bot {
       payerKey: wallet.publicKey,
       recentBlockhash: latestBlockhash.blockhash,
       instructions: [
-        ...(this.isWarp
+        ...(this.isWarp || this.isJito
           ? []
           : [
               ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
